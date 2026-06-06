@@ -5,19 +5,18 @@ const isProduction = process.env.NODE_ENV === 'production';
 
 // Supabase (production) supplies DATABASE_URL.
 // Local dev uses individual DB_* vars from .env.
-// Append sslmode=require if not already in the URL (needed for Supabase pooler)
-function buildConnectionString(url) {
-  if (!url) return null;
-  return url.includes('sslmode') ? url : `${url}?sslmode=require`;
+// Strip any sslmode param from the URL — we control SSL via the Pool config below
+function stripSslMode(url) {
+  if (!url) return url;
+  return url.replace(/[?&]sslmode=[^&]*/g, '').replace(/[?&]$/, '');
 }
 
 const pool = new Pool(
   process.env.DATABASE_URL
     ? {
-        connectionString: buildConnectionString(process.env.DATABASE_URL),
+        connectionString: stripSslMode(process.env.DATABASE_URL),
         ssl: { rejectUnauthorized: false },
-        // Force IPv4 — Render free tier has no IPv6
-        family: 4,
+        family: 4,  // Force IPv4 — Render free tier has no IPv6
       }
     : {
         host: process.env.DB_HOST,
