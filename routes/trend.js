@@ -15,7 +15,7 @@ router.get('/:id/trend', async (req, res) => {
 
     const result = await pool.query(`
       SELECT
-        DATE_TRUNC('day', timestamp) AS day,
+        DATE_TRUNC('day', timestamp) AS date,
         AVG(congestion_score) AS avg_score,
         MIN(congestion_score) AS min_score,
         MAX(congestion_score) AS max_score,
@@ -25,7 +25,7 @@ router.get('/:id/trend', async (req, res) => {
       WHERE destination = $1
         AND timestamp >= NOW() - INTERVAL '15 days'
       GROUP BY DATE_TRUNC('day', timestamp)
-      ORDER BY day ASC
+      ORDER BY date ASC
     `, [name]);
 
     res.json({ destination: name, trend: result.rows });

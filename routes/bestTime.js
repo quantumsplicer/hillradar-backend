@@ -30,13 +30,18 @@ router.get('/:id', async (req, res) => {
 
     const DOW_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 
-    const slots = result.rows.map(row => ({
-      day: DOW_NAMES[parseInt(row.dow)],
-      hour: parseInt(row.hour_bucket),
-      label: `${DOW_NAMES[parseInt(row.dow)]} at ${parseInt(row.hour_bucket)}:00`,
-      avg_score: parseFloat(parseFloat(row.avg_score).toFixed(3)),
-      sample_count: parseInt(row.sample_count),
-    }));
+    const slots = result.rows.map(row => {
+      const d = DOW_NAMES[parseInt(row.dow)];
+      const h = parseInt(row.hour_bucket);
+      const label = `${d} at ${h === 0 ? '12 AM' : h < 12 ? `${h} AM` : h === 12 ? '12 PM' : `${h - 12} PM`}`;
+      return {
+        day: d,
+        hour: h,
+        time_slot: label,
+        avg_score: parseFloat(parseFloat(row.avg_score).toFixed(3)),
+        sample_count: parseInt(row.sample_count),
+      };
+    });
 
     const best = slots[0] || null;
 

@@ -9,6 +9,7 @@ app.use(cors());
 app.use(express.json());
 
 app.use('/api/destinations', require('./routes/destinations'));
+app.use('/api/live-times', require('./routes/liveTimes'));
 app.use('/api/destination', require('./routes/trend'));
 app.use('/api/best-now', require('./routes/bestNow'));
 app.use('/api/best-time', require('./routes/bestTime'));

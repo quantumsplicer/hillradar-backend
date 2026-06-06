@@ -101,6 +101,11 @@ async function initSchema() {
     await client.query(`CREATE INDEX IF NOT EXISTS idx_travel_logs_destination ON travel_logs(destination);`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_travel_logs_timestamp ON travel_logs(timestamp DESC);`);
 
+    // Persist typical (no-traffic) time per destination so live endpoint only needs one Google Maps call
+    await client.query(`ALTER TABLE destinations ADD COLUMN IF NOT EXISTS typical_mins DOUBLE PRECISION;`);
+    // Track destinations Google Maps confirmed have no drivable route
+    await client.query(`ALTER TABLE destinations ADD COLUMN IF NOT EXISTS no_route BOOLEAN DEFAULT FALSE;`);
+
     console.log('Schema ready');
 
     // Upsert destinations
