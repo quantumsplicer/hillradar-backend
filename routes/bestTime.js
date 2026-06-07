@@ -22,7 +22,7 @@ router.get('/:id', async (req, res) => {
         COUNT(*) AS sample_count
       FROM travel_logs
       WHERE destination = $1
-        AND timestamp >= NOW() - INTERVAL '30 days'
+        AND timestamp >= NOW() - INTERVAL '15 days'
       GROUP BY dow, hour_bucket
       ORDER BY avg_score ASC
       LIMIT 5
