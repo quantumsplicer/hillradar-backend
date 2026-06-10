@@ -101,6 +101,22 @@ async function initSchema() {
     await client.query(`CREATE INDEX IF NOT EXISTS idx_travel_logs_destination ON travel_logs(destination);`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_travel_logs_timestamp ON travel_logs(timestamp DESC);`);
 
+    // Per-origin live cache — stores REAL Google Maps current+typical times for
+    // each (user city -> destination) route, so "Right Now" matches what the
+    // user sees in Google Maps from their own city (not a synthesized estimate)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS origin_travel_cache (
+        origin VARCHAR(100) NOT NULL,
+        destination VARCHAR(100) NOT NULL,
+        current_mins DOUBLE PRECISION,
+        typical_mins DOUBLE PRECISION,
+        congestion_score DOUBLE PRECISION,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (origin, destination)
+      );
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_origin_cache_origin ON origin_travel_cache(origin);`);
+
     // Persist typical (no-traffic) time per destination so live endpoint only needs one Google Maps call
     await client.query(`ALTER TABLE destinations ADD COLUMN IF NOT EXISTS typical_mins DOUBLE PRECISION;`);
     // Track destinations Google Maps confirmed have no drivable route

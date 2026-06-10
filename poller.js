@@ -26,16 +26,16 @@ function getBaselineTimestamp() {
   return Math.floor(tuesday.getTime() / 1000);
 }
 
-async function apiBatch(destBatch, nowTs, baselineTs, apiKey, fetchTypical) {
+async function apiBatch(originStr, destBatch, nowTs, baselineTs, apiKey, fetchTypical) {
   const destStr = destBatch.join('|');
   const calls = [
     axios.get('https://maps.googleapis.com/maps/api/distancematrix/json', {
-      params: { origins: ORIGIN, destinations: destStr, departure_time: nowTs, traffic_model: 'best_guess', key: apiKey },
+      params: { origins: originStr, destinations: destStr, departure_time: nowTs, traffic_model: 'best_guess', key: apiKey },
     }),
   ];
   if (fetchTypical) {
     calls.push(axios.get('https://maps.googleapis.com/maps/api/distancematrix/json', {
-      params: { origins: ORIGIN, destinations: destStr, departure_time: baselineTs, traffic_model: 'optimistic', key: apiKey },
+      params: { origins: originStr, destinations: destStr, departure_time: baselineTs, traffic_model: 'optimistic', key: apiKey },
     }));
   }
   const [currentRes, typicalRes] = await Promise.all(calls);
@@ -43,6 +43,17 @@ async function apiBatch(destBatch, nowTs, baselineTs, apiKey, fetchTypical) {
     currentElements: currentRes.data.rows[0].elements,
     typicalElements: fetchTypical ? typicalRes.data.rows[0].elements : null,
   };
+}
+
+// Map a display city name to a Google-Maps-friendly query string.
+// Most Indian city names resolve fine with just ", India" appended;
+// a couple of well-known aliases get an explicit override.
+const ORIGIN_QUERY_OVERRIDES = {
+  Delhi: 'New Delhi, Delhi, India',
+  Gurgaon: 'Gurugram, Haryana, India',
+};
+function originQueryString(origin) {
+  return ORIGIN_QUERY_OVERRIDES[origin] || `${origin}, India`;
 }
 
 // Full poll: fetches current + typical, updates destinations.typical_mins
@@ -68,7 +79,7 @@ async function fetchTravelData() {
     const batch = DESTINATIONS.slice(i, i + BATCH_SIZE);
     const needTypical = batch.some(d => !alreadyHaveTypical.has(d));
     try {
-      const { currentElements, typicalElements } = await apiBatch(batch, nowTs, baselineTs, apiKey, needTypical);
+      const { currentElements, typicalElements } = await apiBatch(ORIGIN, batch, nowTs, baselineTs, apiKey, needTypical);
       for (let j = 0; j < batch.length; j++) {
         const dest = batch[j];
         const curr = currentElements[j];
@@ -122,53 +133,71 @@ async function fetchTravelData() {
   console.log(`[Poller] Updated ${updated}/${DESTINATIONS.length} at ${timestamp}`);
 }
 
-// Light poll: current time only (for live endpoint, uses stored typical_mins)
-async function fetchCurrentOnly() {
+// Live poll for a SPECIFIC user-selected origin city. Fetches the REAL
+// Google Maps current time (and, the first time, the real typical baseline)
+// for that exact origin -> destination route, so the displayed "Right Now"
+// matches what the user sees in Google Maps from their own city — instead of
+// being synthesized from a Delhi-route congestion ratio.
+async function fetchForOrigin(origin) {
   const apiKey = process.env.GOOGLE_MAPS_API_KEY;
   if (!apiKey || apiKey === 'REPLACE_ME') return { ok: false };
 
+  const originStr = originQueryString(origin);
   const nowTs = Math.floor(Date.now() / 1000);
+  const baselineTs = getBaselineTimestamp();
   const timestamp = new Date().toISOString();
   let updated = 0;
 
-  // Get destinations that have typical_mins stored and are not no_route
-  const { rows: dests } = await pool.query(
-    'SELECT name, typical_mins FROM destinations WHERE typical_mins IS NOT NULL AND no_route IS NOT TRUE'
+  const { rows: destRows } = await pool.query(
+    'SELECT name FROM destinations WHERE no_route IS NOT TRUE'
   );
-  if (dests.length === 0) return { ok: false, reason: 'no stored typical_mins yet' };
-
-  const destNames = dests.map(d => d.name);
-  const typicalMap = Object.fromEntries(dests.map(d => [d.name, d.typical_mins]));
+  const { rows: cachedRows } = await pool.query(
+    'SELECT destination, typical_mins FROM origin_travel_cache WHERE origin = $1 AND typical_mins IS NOT NULL',
+    [origin]
+  );
+  const typicalMap = Object.fromEntries(cachedRows.map(r => [r.destination, r.typical_mins]));
+  const destNames = destRows.map(r => r.name);
 
   for (let i = 0; i < destNames.length; i += BATCH_SIZE) {
     const batch = destNames.slice(i, i + BATCH_SIZE);
+    const needTypical = batch.some(d => typicalMap[d] == null);
     try {
-      const res = await axios.get('https://maps.googleapis.com/maps/api/distancematrix/json', {
-        params: { origins: ORIGIN, destinations: batch.join('|'), departure_time: nowTs, traffic_model: 'best_guess', key: apiKey },
-      });
-      const elements = res.data.rows[0].elements;
+      const { currentElements, typicalElements } = await apiBatch(originStr, batch, nowTs, baselineTs, apiKey, needTypical);
       for (let j = 0; j < batch.length; j++) {
         const dest = batch[j];
-        const el = elements[j];
-        if (el.status !== 'OK') {
-          await pool.query('UPDATE destinations SET no_route = TRUE WHERE name = $1', [dest]);
-          continue;
+        const curr = currentElements[j];
+        if (curr.status !== 'OK') continue; // route status for this origin is unreliable; skip rather than mis-flag
+
+        const currentMins = curr.duration_in_traffic ? curr.duration_in_traffic.value / 60 : curr.duration.value / 60;
+
+        let typicalMins = typicalMap[dest];
+        if (typicalMins == null && typicalElements) {
+          const typ = typicalElements[j];
+          if (typ.status === 'OK') {
+            typicalMins = Math.round(typ.duration.value / 60);
+            typicalMap[dest] = typicalMins;
+          }
         }
-        const currentMins = el.duration_in_traffic ? el.duration_in_traffic.value / 60 : el.duration.value / 60;
-        const typicalMins = typicalMap[dest];
+        if (typicalMins == null) continue;
+
         const congestionScore = parseFloat((currentMins / typicalMins).toFixed(3));
         await pool.query(
-          `INSERT INTO travel_logs (destination, timestamp, current_duration_mins, typical_duration_mins, congestion_score)
-           VALUES ($1, $2, $3, $4, $5)`,
-          [dest, timestamp, Math.round(currentMins), typicalMins, congestionScore]
+          `INSERT INTO origin_travel_cache (origin, destination, current_mins, typical_mins, congestion_score, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           ON CONFLICT (origin, destination) DO UPDATE SET
+             current_mins = EXCLUDED.current_mins,
+             typical_mins = COALESCE(origin_travel_cache.typical_mins, EXCLUDED.typical_mins),
+             congestion_score = EXCLUDED.current_mins / COALESCE(origin_travel_cache.typical_mins, EXCLUDED.typical_mins),
+             updated_at = EXCLUDED.updated_at`,
+          [origin, dest, Math.round(currentMins), typicalMins, congestionScore, timestamp]
         );
         updated++;
       }
     } catch (err) {
-      console.error(`[Poller:light] Batch error: ${err.message}`);
+      console.error(`[Poller:origin=${origin}] Batch error: ${err.message}`);
     }
   }
-  console.log(`[Poller:light] Updated ${updated} destinations at ${timestamp}`);
+  console.log(`[Poller:origin=${origin}] Updated ${updated} destinations at ${timestamp}`);
   return { ok: true, updated, timestamp };
 }
 
@@ -178,4 +207,4 @@ function startPoller() {
   fetchTravelData();
 }
 
-module.exports = { startPoller, fetchTravelData, fetchCurrentOnly };
+module.exports = { startPoller, fetchTravelData, fetchForOrigin };
