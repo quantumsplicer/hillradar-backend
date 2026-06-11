@@ -25,7 +25,7 @@ function refresh(origin) {
 
 async function loadCache(origin) {
   const { rows } = await pool.query(`
-    SELECT c.destination, c.current_mins, c.typical_mins, c.congestion_score, c.updated_at,
+    SELECT c.destination, c.current_mins, c.typical_mins, c.congestion_score, c.seasonal_multiplier, c.updated_at,
            d.id, d.lat, d.lng, d.description, d.image_url
     FROM origin_travel_cache c
     JOIN destinations d ON d.name = c.destination

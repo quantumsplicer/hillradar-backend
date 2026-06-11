@@ -16,6 +16,15 @@ const DESTINATIONS = [
 
 const BATCH_SIZE = 20;
 
+// Seasonal multiplier: how much busier a destination has been recently (last
+// 15 days) vs its longer-term baseline (last 90 days), based on the Delhi-
+// anchored travel_logs history. Applied on top of each origin's "pessimistic"
+// estimate so a destination in high season reads higher for every origin,
+// without needing per-origin historical data. Clamped to [1, MAX] so it only
+// ever raises the estimate above the pessimistic baseline, never below it.
+const SEASONAL_MIN_BASELINE_SAMPLES = 30;
+const SEASONAL_MAX_MULTIPLIER = 2.0;
+
 function getBaselineTimestamp() {
   const now = new Date();
   const day = now.getDay();
@@ -26,11 +35,11 @@ function getBaselineTimestamp() {
   return Math.floor(tuesday.getTime() / 1000);
 }
 
-async function apiBatch(originStr, destBatch, nowTs, baselineTs, apiKey, fetchTypical) {
+async function apiBatch(originStr, destBatch, nowTs, baselineTs, apiKey, fetchTypical, currentTrafficModel = 'best_guess') {
   const destStr = destBatch.join('|');
   const calls = [
     axios.get('https://maps.googleapis.com/maps/api/distancematrix/json', {
-      params: { origins: originStr, destinations: destStr, departure_time: nowTs, traffic_model: 'best_guess', key: apiKey },
+      params: { origins: originStr, destinations: destStr, departure_time: nowTs, traffic_model: currentTrafficModel, key: apiKey },
     }),
   ];
   if (fetchTypical) {
@@ -133,6 +142,30 @@ async function fetchTravelData() {
   console.log(`[Poller] Updated ${updated}/${DESTINATIONS.length} at ${timestamp}`);
 }
 
+// Computes a per-destination seasonal multiplier from the Delhi-anchored
+// travel_logs history: (avg congestion, last 15 days) / (avg congestion,
+// last 90 days), clamped to [1, SEASONAL_MAX_MULTIPLIER]. Falls back to 1
+// (no adjustment) until enough baseline history has accumulated.
+async function getSeasonalMultipliers() {
+  const { rows } = await pool.query(`
+    SELECT destination,
+      AVG(congestion_score) FILTER (WHERE timestamp >= NOW() - INTERVAL '15 days') AS recent_avg,
+      AVG(congestion_score) FILTER (WHERE timestamp >= NOW() - INTERVAL '90 days') AS baseline_avg,
+      COUNT(*) FILTER (WHERE timestamp >= NOW() - INTERVAL '90 days') AS baseline_count
+    FROM travel_logs
+    GROUP BY destination
+  `);
+  const multipliers = {};
+  for (const r of rows) {
+    let m = 1;
+    if (r.recent_avg != null && r.baseline_avg > 0 && parseInt(r.baseline_count, 10) >= SEASONAL_MIN_BASELINE_SAMPLES) {
+      m = Math.max(1, Math.min(r.recent_avg / r.baseline_avg, SEASONAL_MAX_MULTIPLIER));
+    }
+    multipliers[r.destination] = parseFloat(m.toFixed(3));
+  }
+  return multipliers;
+}
+
 // Live poll for a SPECIFIC user-selected origin city. Fetches the REAL
 // Google Maps current time (and, the first time, the real typical baseline)
 // for that exact origin -> destination route, so the displayed "Right Now"
@@ -157,18 +190,22 @@ async function fetchForOrigin(origin) {
   );
   const typicalMap = Object.fromEntries(cachedRows.map(r => [r.destination, r.typical_mins]));
   const destNames = destRows.map(r => r.name);
+  const seasonalMultipliers = await getSeasonalMultipliers();
 
   for (let i = 0; i < destNames.length; i += BATCH_SIZE) {
     const batch = destNames.slice(i, i + BATCH_SIZE);
     const needTypical = batch.some(d => typicalMap[d] == null);
     try {
-      const { currentElements, typicalElements } = await apiBatch(originStr, batch, nowTs, baselineTs, apiKey, needTypical);
+      // "Now" uses the pessimistic traffic model — Google's safe-upper-bound
+      // prediction for this exact origin -> destination route, so it errs
+      // toward not understating travel time.
+      const { currentElements, typicalElements } = await apiBatch(originStr, batch, nowTs, baselineTs, apiKey, needTypical, 'pessimistic');
       for (let j = 0; j < batch.length; j++) {
         const dest = batch[j];
         const curr = currentElements[j];
         if (curr.status !== 'OK') continue; // route status for this origin is unreliable; skip rather than mis-flag
 
-        const currentMins = curr.duration_in_traffic ? curr.duration_in_traffic.value / 60 : curr.duration.value / 60;
+        const rawCurrentMins = curr.duration_in_traffic ? curr.duration_in_traffic.value / 60 : curr.duration.value / 60;
 
         let typicalMins = typicalMap[dest];
         if (typicalMins == null && typicalElements) {
@@ -180,16 +217,23 @@ async function fetchForOrigin(origin) {
         }
         if (typicalMins == null) continue;
 
+        // Scale the pessimistic estimate up further if this destination has
+        // been running hotter than its 90-day baseline lately (e.g. summer
+        // tourist season) — never scales it down.
+        const seasonalMultiplier = seasonalMultipliers[dest] ?? 1;
+        const currentMins = rawCurrentMins * seasonalMultiplier;
+
         const congestionScore = parseFloat((currentMins / typicalMins).toFixed(3));
         await pool.query(
-          `INSERT INTO origin_travel_cache (origin, destination, current_mins, typical_mins, congestion_score, updated_at)
-           VALUES ($1, $2, $3, $4, $5, $6)
+          `INSERT INTO origin_travel_cache (origin, destination, current_mins, typical_mins, congestion_score, seasonal_multiplier, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
            ON CONFLICT (origin, destination) DO UPDATE SET
              current_mins = EXCLUDED.current_mins,
              typical_mins = COALESCE(origin_travel_cache.typical_mins, EXCLUDED.typical_mins),
              congestion_score = EXCLUDED.current_mins / COALESCE(origin_travel_cache.typical_mins, EXCLUDED.typical_mins),
+             seasonal_multiplier = EXCLUDED.seasonal_multiplier,
              updated_at = EXCLUDED.updated_at`,
-          [origin, dest, Math.round(currentMins), typicalMins, congestionScore, timestamp]
+          [origin, dest, Math.round(currentMins), typicalMins, congestionScore, seasonalMultiplier, timestamp]
         );
         updated++;
       }
@@ -207,4 +251,4 @@ function startPoller() {
   fetchTravelData();
 }
 
-module.exports = { startPoller, fetchTravelData, fetchForOrigin };
+module.exports = { startPoller, fetchTravelData, fetchForOrigin, getSeasonalMultipliers };

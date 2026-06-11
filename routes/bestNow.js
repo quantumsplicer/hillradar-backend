@@ -26,6 +26,7 @@ router.get('/', async (req, res) => {
         congestion_score: r.congestion_score,
         typical_duration_mins: Math.round(r.typical_mins),
         current_duration_mins: Math.round(r.current_mins),
+        seasonal_multiplier: r.seasonal_multiplier,
         last_updated: r.updated_at,
       }));
 

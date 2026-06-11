@@ -116,6 +116,9 @@ async function initSchema() {
       );
     `);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_origin_cache_origin ON origin_travel_cache(origin);`);
+    // Seasonal multiplier applied to the pessimistic "current" estimate based
+    // on how this destination's traffic has trended recently vs its 90-day baseline
+    await client.query(`ALTER TABLE origin_travel_cache ADD COLUMN IF NOT EXISTS seasonal_multiplier DOUBLE PRECISION DEFAULT 1;`);
 
     // Persist typical (no-traffic) time per destination so live endpoint only needs one Google Maps call
     await client.query(`ALTER TABLE destinations ADD COLUMN IF NOT EXISTS typical_mins DOUBLE PRECISION;`);
